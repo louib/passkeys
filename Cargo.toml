@@ -1,0 +1,19 @@
+[package]
+name = "passkeys"
+version = "0.1.0"
+edition = "2024"
+
+description = "Experimental library for using MPC with passkeys"
+repository = "https://github.com/louib/passkeys"
+homepage = "https://github.com/louib/passkeys"
+license = "MIT"
+
+readme = "README.md"
+
+include = [
+  "src/",
+  "README.md",
+  "LICENSE",
+]
+
+[dependencies]
