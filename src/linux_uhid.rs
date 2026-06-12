@@ -87,8 +87,8 @@ struct UhidOutputReq {
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct UhidInput2Req {
-    data: [u8; UHID_DATA_MAX],
     size: u16,
+    data: [u8; UHID_DATA_MAX],
 }
 
 #[derive(Clone, Copy)]
