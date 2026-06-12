@@ -3,7 +3,6 @@ use ciborium::value::Value;
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rand::RngCore;
-use sha2::Sha256;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -173,10 +172,11 @@ impl UhidAuthenticator {
 
                 let data_start = 4;
                 let available_data = n.saturating_sub(data_start);
-                let report_len = available_data.min(64);
+                let report_len = available_data.min(65);
                 let report_data = &buf[data_start..data_start + report_len];
 
                 if let Some(packet) = CtapHidPacket::parse(report_data) {
+                    info!("Successfully parsed packet: {:?}", packet);
                     if let Some(message) = self.reassembler.handle_packet(packet) {
                         info!(
                             "Full message received: cmd=0x{:02x}, payload_len={}",
@@ -185,6 +185,8 @@ impl UhidAuthenticator {
                         );
                         self.handle_message(message)?;
                     }
+                } else {
+                    warn!("Failed to parse packet from raw data: {:02x?}", report_data);
                 }
             }
         }
@@ -235,15 +237,7 @@ impl UhidAuthenticator {
                         // 1: versions
                         map.push((
                             Value::Integer(1.into()),
-                            Value::Array(vec![
-                                Value::Text("FIDO_2_0".into()),
-                                Value::Text("FIDO_2_1".into()),
-                            ]),
-                        ));
-                        // 2: extensions
-                        map.push((
-                            Value::Integer(2.into()),
-                            Value::Array(vec![Value::Text("credProtect".into())]),
+                            Value::Array(vec![Value::Text("FIDO_2_0".into())]),
                         ));
                         // 3: aaguid (16 bytes)
                         map.push((Value::Integer(3.into()), Value::Bytes(vec![0u8; 16])));
@@ -251,17 +245,7 @@ impl UhidAuthenticator {
                         let mut options = Vec::new();
                         options.push((Value::Text("rk".into()), Value::Bool(true)));
                         options.push((Value::Text("up".into()), Value::Bool(true)));
-                        options.push((Value::Text("uv".into()), Value::Bool(true)));
                         map.push((Value::Integer(4.into()), Value::Map(options)));
-
-                        // 6: algorithms
-                        let mut alg = Vec::new();
-                        alg.push((Value::Text("type".into()), Value::Text("public-key".into())));
-                        alg.push((Value::Text("alg".into()), Value::Integer((-8).into()))); // EdDSA
-                        map.push((
-                            Value::Integer(6.into()),
-                            Value::Array(vec![Value::Map(alg)]),
-                        ));
 
                         let mut payload = Vec::new();
                         payload.push(0x00); // Status: CTAP2_OK
@@ -278,34 +262,20 @@ impl UhidAuthenticator {
                         // authenticatorMakeCredential
                         info!("CTAP2 Command: authenticatorMakeCredential");
 
-                        // 1. Generate Ed25519 Key Pair
                         let mut rng = rand::thread_rng();
                         let signing_key = SigningKey::generate(&mut rng);
                         let public_key = signing_key.verifying_key();
 
-                        // 2. Construct authData
                         let mut auth_data = Vec::new();
+                        auth_data.extend_from_slice(&[0u8; 32]); // rpIdHash
+                        auth_data.push(0b01000001); // flags
+                        auth_data.extend_from_slice(&[0u8; 4]); // signCount
+                        auth_data.extend_from_slice(&[0u8; 16]); // aaguid
 
-                        // rpIdHash (32 bytes) - Placeholder for SHA256(rpId)
-                        auth_data.extend_from_slice(&[0u8; 32]);
-
-                        // flags (1 byte): UP (bit 0), AT (bit 6)
-                        auth_data.push(0b01000001);
-
-                        // signCount (4 bytes)
-                        auth_data.extend_from_slice(&[0u8; 4]);
-
-                        // aaguid (16 bytes)
-                        auth_data.extend_from_slice(&[0u8; 16]);
-
-                        // L (2 bytes): Credential ID length
                         let cred_id = b"dummy-credential-id";
                         auth_data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
-
-                        // credentialId
                         auth_data.extend_from_slice(cred_id);
 
-                        // credentialPublicKey (COSE)
                         let mut cose_key = Vec::new();
                         cose_key.push((Value::Integer(1.into()), Value::Integer(1.into()))); // kty: OKP
                         cose_key.push((Value::Integer(3.into()), Value::Integer((-8).into()))); // alg: EdDSA
@@ -319,7 +289,6 @@ impl UhidAuthenticator {
                         ciborium::ser::into_writer(&Value::Map(cose_key), &mut cose_buf)?;
                         auth_data.extend_from_slice(&cose_buf);
 
-                        // 3. Construct Attestation Object
                         let mut attestation = Vec::new();
                         attestation.push((Value::Text("fmt".into()), Value::Text("none".into())));
                         attestation.push((Value::Text("attStmt".into()), Value::Map(vec![])));
@@ -349,6 +318,11 @@ impl UhidAuthenticator {
     }
 
     fn send_message(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {
+        info!(
+            "Sending message: cmd=0x{:02x}, payload_len={}",
+            message.cmd,
+            message.payload.len()
+        );
         let packets = message.to_packets();
         for packet in packets {
             let report = packet.serialize();
@@ -367,8 +341,19 @@ impl UhidAuthenticator {
                     mem::size_of::<UhidEvent>(),
                 )
             };
+
+            // Log fields by copying them first to avoid unaligned reference errors in packed structs
+            let ev_type = event.event_type;
+            let req_size = unsafe { event.u.input2.size };
+            info!(
+                "Writing to /dev/uhid ({} bytes): event_type={}, size={}",
+                buf.len(),
+                ev_type,
+                req_size
+            );
             self.file.write_all(buf)?;
         }
+        info!("Message sent successfully.");
         Ok(())
     }
 }
