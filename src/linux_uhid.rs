@@ -1,3 +1,4 @@
+use crate::ctap_hid::{CtapHidPacket, CtapHidReassembler};
 use log::{info, warn};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
@@ -101,6 +102,7 @@ struct UhidEvent {
 /// A pure-Rust scaffolding for a virtual FIDO2 authenticator over UHID.
 pub struct UhidAuthenticator {
     file: File,
+    reassembler: CtapHidReassembler,
 }
 
 impl UhidAuthenticator {
@@ -134,7 +136,10 @@ impl UhidAuthenticator {
         file.write_all(buf)?;
         info!("Virtual device created successfully.");
 
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            reassembler: CtapHidReassembler::new(),
+        })
     }
 
     /// Listens for HID events from the kernel and logs them.
@@ -154,8 +159,20 @@ impl UhidAuthenticator {
 
             if event_type == UHID_OUTPUT {
                 info!("Packet Received! The browser is talking to our Rust binary.");
-                // Note: The actual payload is in the union field `output`.
-                warn!("Next: Implement the FIDO2/CTAP2 state machine to respond.");
+
+                // Safety: UhidEvent is repr(C, packed). We cast the buffer to access the output data.
+                let event: &UhidEvent = unsafe { &*(buf.as_ptr() as *const UhidEvent) };
+                let output = unsafe { &event.u.output };
+                let report_data = &output.data[..output.size as usize];
+
+                if let Some(packet) = CtapHidPacket::parse(report_data) {
+                    if let Some(message) = self.reassembler.handle_packet(packet) {
+                        info!("Full CTAP HID Message received: {:?}", message);
+                        warn!("Next: Implement the CTAP2 CBOR command handler.");
+                    }
+                } else {
+                    warn!("Failed to parse CTAP HID packet.");
+                }
             }
         }
     }
