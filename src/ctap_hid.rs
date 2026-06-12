@@ -75,8 +75,16 @@ struct IncompleteMessage {
 }
 
 impl CtapHidPacket {
-    /// Parses a raw HID report (expected to be 64 bytes) into a `CtapHidPacket`.
-    pub fn parse(buf: &[u8]) -> Option<Self> {
+    /// Parses a raw HID report into a `CtapHidPacket`.
+    /// Handles reports with or without a 1-byte Report ID.
+    pub fn parse(mut buf: &[u8]) -> Option<Self> {
+        // If the buffer is 65 bytes, it likely has a 1-byte Report ID at the start.
+        if buf.len() == 65 {
+            buf = &buf[1..];
+        } else if buf.len() > 0 && buf[0] == 0x00 && buf.len() > 64 {
+            buf = &buf[1..];
+        }
+
         if buf.len() < 5 {
             return None;
         }
@@ -93,7 +101,6 @@ impl CtapHidPacket {
             let bcnt = u16::from_be_bytes(buf[5..7].try_into().ok()?);
             let mut data = [0u8; 57];
 
-            // The data starts at index 7. We copy up to 57 bytes.
             let available_data = &buf[7..];
             let copy_len = available_data.len().min(57);
             data[..copy_len].copy_from_slice(&available_data[..copy_len]);
@@ -109,13 +116,71 @@ impl CtapHidPacket {
             let seq = first_byte;
             let mut data = [0u8; 59];
 
-            // The data starts at index 5. We copy up to 59 bytes.
             let available_data = &buf[5..];
             let copy_len = available_data.len().min(59);
             data[..copy_len].copy_from_slice(&available_data[..copy_len]);
 
             Some(CtapHidPacket::Cont(CtapHidContPacket { cid, seq, data }))
         }
+    }
+
+    /// Serializes the packet into a 64-byte HID report.
+    pub fn serialize(&self) -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        match self {
+            CtapHidPacket::Init(init) => {
+                buf[0..4].copy_from_slice(&init.cid.to_be_bytes());
+                buf[4] = init.cmd;
+                buf[5..7].copy_from_slice(&init.bcnt.to_be_bytes());
+                buf[7..].copy_from_slice(&init.data);
+            }
+            CtapHidPacket::Cont(cont) => {
+                buf[0..4].copy_from_slice(&cont.cid.to_be_bytes());
+                buf[4] = cont.seq;
+                buf[5..].copy_from_slice(&cont.data);
+            }
+        }
+        buf
+    }
+}
+
+impl CtapHidMessage {
+    /// Splits a message into one or more HID packets.
+    pub fn to_packets(&self) -> Vec<CtapHidPacket> {
+        let mut packets = Vec::new();
+        let payload = &self.payload;
+
+        // First packet (Init)
+        let mut init_data = [0u8; 57];
+        let init_len = payload.len().min(57);
+        init_data[..init_len].copy_from_slice(&payload[..init_len]);
+
+        packets.push(CtapHidPacket::Init(CtapHidInitPacket {
+            cid: self.cid,
+            cmd: self.cmd, // Already has bit 7 set from the message source usually
+            bcnt: payload.len() as u16,
+            data: init_data,
+        }));
+
+        // Subsequent packets (Cont)
+        let mut offset = init_len;
+        let mut seq = 0u8;
+        while offset < payload.len() {
+            let mut cont_data = [0u8; 59];
+            let cont_len = (payload.len() - offset).min(59);
+            cont_data[..cont_len].copy_from_slice(&payload[offset..offset + cont_len]);
+
+            packets.push(CtapHidPacket::Cont(CtapHidContPacket {
+                cid: self.cid,
+                seq,
+                data: cont_data,
+            }));
+
+            offset += cont_len;
+            seq += 1;
+        }
+
+        packets
     }
 }
 
