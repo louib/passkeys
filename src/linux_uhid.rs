@@ -1,8 +1,15 @@
-use soft_fido2::{Authenticator, AuthenticatorConfigBuilder};
+use log::{info, warn};
 use std::error::Error;
-use std::os::unix::io::AsRawFd;
-use tokio::io::unix::AsyncFd;
-use uhid_virt::{Bus, CreateParams, UHIDDevice};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::mem;
+
+// --- Linux UHID API Constants (from uhid.h) ---
+const UHID_CREATE2: u32 = 11;
+const UHID_OUTPUT: u32 = 6;
+const BUS_USB: u16 = 0x03;
+const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
+const UHID_DATA_MAX: usize = 4096;
 
 /// FIDO Alliance Usage Page (0xF1D0).
 const USAGE_PAGE_FIDO: u8 = 0xd0;
@@ -11,8 +18,7 @@ const USAGE_U2F_AUTHENTICATOR: u8 = 0x01;
 
 /// FIDO2 HID Report Descriptor.
 ///
-/// This descriptor informs the Linux kernel that the virtual device is a FIDO2-compliant
-/// security key. It defines two 64-byte raw reports for input and output.
+/// This informs the kernel that this device is a FIDO2 security key.
 const FIDO_REPORT_DESC: &[u8] = &[
     0x06,
     USAGE_PAGE_FIDO,
@@ -50,75 +56,106 @@ const FIDO_REPORT_DESC: &[u8] = &[
     0xc0, // End Collection
 ];
 
-/// Default Vendor ID for the virtual MPC token.
-pub const DEFAULT_VENDOR_ID: u32 = 0x1234;
-/// Default Product ID for the virtual MPC token.
-pub const DEFAULT_PRODUCT_ID: u32 = 0x5678;
+// --- C-Compatible Structs (Zero-Dependency) ---
 
-/// A virtual FIDO2 authenticator that emulates a hardware security key on Linux.
-pub struct VirtualAuthenticator {
-    device: AsyncFd<UHIDDevice>,
-    authenticator: Authenticator,
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct UhidCreate2Req {
+    name: [u8; 128],
+    phys: [u8; 64],
+    uniq: [u8; 64],
+    rd_size: u16,
+    bus: u16,
+    vendor: u32,
+    product: u32,
+    version: u32,
+    country: u32,
+    rd_data: [u8; HID_MAX_DESCRIPTOR_SIZE],
 }
 
-impl VirtualAuthenticator {
-    /// Creates a new virtual authenticator.
-    ///
-    /// This requires access to `/dev/uhid`, which usually requires root privileges
-    /// or specific udev rules.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct UhidOutputReq {
+    data: [u8; UHID_DATA_MAX],
+    size: u16,
+    rtype: u8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+#[allow(dead_code)]
+union UhidEventUnion {
+    create2: UhidCreate2Req,
+    output: UhidOutputReq,
+    // Padding to the maximum possible event size in the kernel
+    _padding: [u8; 4352],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct UhidEvent {
+    event_type: u32,
+    u: UhidEventUnion,
+}
+
+/// A pure-Rust scaffolding for a virtual FIDO2 authenticator over UHID.
+pub struct UhidAuthenticator {
+    file: File,
+}
+
+impl UhidAuthenticator {
+    /// Creates a new virtual authenticator by opening /dev/uhid.
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        let params = CreateParams {
-            name: "MPC Passkey Virtual Token".into(),
-            phys: "virt-fido-0".into(),
-            uniq: "0001".into(),
-            bus: Bus::USB,
-            vendor: DEFAULT_VENDOR_ID,
-            product: DEFAULT_PRODUCT_ID,
-            version: 0,
-            country: 0,
-            rd_data: FIDO_REPORT_DESC.to_vec(),
+        info!("Opening /dev/uhid (Pure-Rust)...");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/uhid")?;
+
+        // 1. Prepare the Create Request
+        let mut event: UhidEvent = unsafe { mem::zeroed() };
+        event.event_type = UHID_CREATE2;
+
+        unsafe {
+            let req = &mut event.u.create2;
+            let name = b"MPC Passkey Pure-Rust Device";
+            req.name[..name.len()].copy_from_slice(name);
+            req.bus = BUS_USB;
+            req.vendor = 0x1234;
+            req.product = 0x5678;
+            req.rd_size = FIDO_REPORT_DESC.len() as u16;
+            req.rd_data[..FIDO_REPORT_DESC.len()].copy_from_slice(FIDO_REPORT_DESC);
+        }
+
+        // 2. Write the event to /dev/uhid to register the device
+        let buf = unsafe {
+            std::slice::from_raw_parts(&event as *const _ as *const u8, mem::size_of::<UhidEvent>())
         };
+        file.write_all(buf)?;
+        info!("Virtual device created successfully.");
 
-        let device = UHIDDevice::create(params)?;
-        let async_device = AsyncFd::new(device)?;
-
-        let config = AuthenticatorConfigBuilder::new()
-            .with_resident_key_support(true)
-            .with_user_verification_support(true)
-            .build();
-
-        let authenticator = Authenticator::new(config);
-
-        Ok(Self {
-            device: async_device,
-            authenticator,
-        })
+        Ok(Self { file })
     }
 
-    /// Starts the authenticator loop, processing HID reports from the kernel.
-    pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Listens for HID events from the kernel and logs them.
+    pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        info!("Listening for HID events. Use https://webauthn.io to test.");
+
+        let mut buf = vec![0u8; mem::size_of::<UhidEvent>()];
+
         loop {
-            // Wait for the device to be readable
-            let mut guard = self.device.readable().await?;
+            let n = self.file.read(&mut buf)?;
+            if n < 4 {
+                continue;
+            }
 
-            // Read the HID event
-            match guard.get_inner().read_event() {
-                Ok(uhid_virt::OutputEvent::Output { data }) => {
-                    // Process the CTAP2 packet through the FIDO2 state machine
-                    let responses = self.authenticator.process_packet(&data);
+            // Extract the 4-byte event type
+            let event_type = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
 
-                    // Send responses back to the kernel
-                    for resp in responses {
-                        guard.get_inner().write_input(&resp)?;
-                    }
-                }
-                Ok(_) => {} // Ignore other events for now
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // This shouldn't happen often with AsyncFd, but we handle it
-                    guard.clear_ready();
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
+            if event_type == UHID_OUTPUT {
+                info!("Packet Received! The browser is talking to our Rust binary.");
+                // Note: The actual payload is in the union field `output`.
+                warn!("Next: Implement the FIDO2/CTAP2 state machine to respond.");
             }
         }
     }
