@@ -3,9 +3,10 @@ use ciborium::value::Value;
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::mem;
 
 // --- Linux UHID API Constants (from uhid.h) ---
@@ -16,10 +17,76 @@ const BUS_USB: u16 = 0x03;
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 const UHID_DATA_MAX: usize = 4096;
 
+/// CTAP HID capability bit: authenticator supports CTAP2 CBOR commands.
+const CTAP_HID_CAPABILITY_CBOR: u8 = 0x04;
+
+/// CTAP2 authenticatorGetInfo response key: supported protocol versions.
+const CTAP2_GET_INFO_VERSIONS: i64 = 1;
+/// CTAP2 authenticatorGetInfo response key: authenticator AAGUID.
+const CTAP2_GET_INFO_AAGUID: i64 = 3;
+/// CTAP2 authenticatorGetInfo response key: supported authenticator options.
+const CTAP2_GET_INFO_OPTIONS: i64 = 4;
+/// CTAP2 authenticatorGetInfo response key: supported credential algorithms.
+const CTAP2_GET_INFO_ALGORITHMS: i64 = 10;
+/// CTAP2 authenticatorMakeCredential request key: relying party entity.
+const CTAP2_MAKE_CREDENTIAL_RP: i64 = 2;
+/// CTAP2 authenticatorMakeCredential response key: attestation statement format.
+const CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT: i64 = 1;
+/// CTAP2 authenticatorMakeCredential response key: authenticator data.
+const CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA: i64 = 2;
+/// CTAP2 authenticatorMakeCredential response key: attestation statement.
+const CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT: i64 = 3;
+const CTAP2_VERSION_FIDO_2_0: &str = "FIDO_2_0";
+const CTAP2_VERSION_FIDO_2_1_PRE: &str = "FIDO_2_1_PRE";
+const CTAP2_STATUS_OK: u8 = 0x00;
+const CTAP2_STATUS_OPERATION_DENIED: u8 = 0x27;
+
+/// COSE key parameter: key type (`kty`).
+const COSE_KEY_TYPE: i64 = 1;
+/// COSE key parameter: signing algorithm (`alg`).
+const COSE_KEY_ALGORITHM: i64 = 3;
+/// COSE key parameter: elliptic curve (`crv`).
+const COSE_KEY_CURVE: i64 = -1;
+/// COSE key parameter: public key x-coordinate.
+const COSE_KEY_X_COORDINATE: i64 = -2;
+/// COSE key type value for octet key pairs (`OKP`).
+const COSE_KEY_TYPE_OKP: i64 = 1;
+/// COSE algorithm value for EdDSA.
+const COSE_ALGORITHM_EDDSA: i64 = -8;
+/// COSE curve value for Ed25519.
+const COSE_CURVE_ED25519: i64 = 6;
+/// U2F APDU instruction: register.
+const U2F_APDU_REGISTER: u8 = 0x01;
+/// U2F APDU instruction: version.
+const U2F_APDU_VERSION: u8 = 0x03;
+/// Chrome's synthetic U2F register probe uses P1=0x03.
+const U2F_REGISTER_PROBE_P1: u8 = 0x03;
+/// APDU status word: command completed successfully.
+const APDU_SW_NO_ERROR: [u8; 2] = [0x90, 0x00];
+/// APDU status word: user presence or similar condition is not currently satisfied.
+const APDU_SW_CONDITIONS_NOT_SATISFIED: [u8; 2] = [0x69, 0x85];
+/// APDU status word: instruction is not supported.
+const APDU_SW_INS_NOT_SUPPORTED: [u8; 2] = [0x6d, 0x00];
+/// U2F register response reserved byte.
+const U2F_REGISTER_RESPONSE_RESERVED: u8 = 0x05;
+/// U2F public keys are uncompressed P-256 points.
+const U2F_PUBLIC_KEY_LEN: usize = 65;
+const U2F_DUMMY_KEY_HANDLE: &[u8] = b"chrome-presence-probe";
+const U2F_DUMMY_ATTESTATION_CERT_DER: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x00];
+const U2F_DUMMY_SIGNATURE_DER: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+
 /// FIDO Alliance Usage Page (0xF1D0).
 const USAGE_PAGE_FIDO: u8 = 0xd0;
 /// U2F HID Authenticator Usage (0x01).
 const USAGE_U2F_AUTHENTICATOR: u8 = 0x01;
+
+mod ctap2_command {
+    pub const MAKE_CREDENTIAL: u8 = 0x01;
+    pub const GET_ASSERTION: u8 = 0x02;
+    pub const GET_INFO: u8 = 0x04;
+    pub const CLIENT_PIN: u8 = 0x06;
+    pub const SELECTION: u8 = 0x0b;
+}
 
 /// FIDO2 HID Report Descriptor.
 const FIDO_REPORT_DESC: &[u8] = &[
@@ -194,6 +261,15 @@ impl UhidAuthenticator {
 
     fn handle_message(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {
         match message.cmd {
+            command::PING => {
+                info!("Handling CTAP_HID_PING");
+                let response = CtapHidMessage {
+                    cid: message.cid,
+                    cmd: command::PING,
+                    payload: message.payload,
+                };
+                self.send_message(response)?;
+            }
             command::INIT => {
                 info!("Handling CTAP_HID_INIT");
                 if message.payload.len() < 8 {
@@ -211,7 +287,9 @@ impl UhidAuthenticator {
                 response_payload.push(0x01); // Version major
                 response_payload.push(0x00); // Version minor
                 response_payload.push(0x00); // Version build
-                response_payload.push(0x01); // Capabilities (WINK)
+                let capabilities = CTAP_HID_CAPABILITY_CBOR;
+                response_payload.push(capabilities);
+                info!("CTAP_HID_INIT capabilities=0x{:02x}", capabilities);
 
                 let response = CtapHidMessage {
                     cid: message.cid,
@@ -219,6 +297,18 @@ impl UhidAuthenticator {
                     payload: response_payload,
                 };
                 self.send_message(response)?;
+            }
+            command::WINK => {
+                info!("Handling CTAP_HID_WINK");
+                let response = CtapHidMessage {
+                    cid: message.cid,
+                    cmd: command::WINK,
+                    payload: Vec::new(),
+                };
+                self.send_message(response)?;
+            }
+            command::MSG => {
+                self.handle_u2f_msg(message)?;
             }
             command::CBOR => {
                 info!("Handling CTAP_HID_CBOR");
@@ -229,26 +319,48 @@ impl UhidAuthenticator {
 
                 let ctap_cmd = message.payload[0];
                 match ctap_cmd {
-                    0x06 => {
+                    ctap2_command::GET_INFO => {
                         // authenticatorGetInfo
                         info!("CTAP2 Command: authenticatorGetInfo");
 
                         let mut map = Vec::new();
                         // 1: versions
                         map.push((
-                            Value::Integer(1.into()),
-                            Value::Array(vec![Value::Text("FIDO_2_0".into())]),
+                            Value::Integer(CTAP2_GET_INFO_VERSIONS.into()),
+                            Value::Array(vec![
+                                Value::Text(CTAP2_VERSION_FIDO_2_0.into()),
+                                Value::Text(CTAP2_VERSION_FIDO_2_1_PRE.into()),
+                            ]),
                         ));
                         // 3: aaguid (16 bytes)
-                        map.push((Value::Integer(3.into()), Value::Bytes(vec![0u8; 16])));
+                        map.push((
+                            Value::Integer(CTAP2_GET_INFO_AAGUID.into()),
+                            Value::Bytes(vec![0u8; 16]),
+                        ));
                         // 4: options
                         let mut options = Vec::new();
-                        options.push((Value::Text("rk".into()), Value::Bool(true)));
+                        options.push((Value::Text("rk".into()), Value::Bool(false)));
                         options.push((Value::Text("up".into()), Value::Bool(true)));
-                        map.push((Value::Integer(4.into()), Value::Map(options)));
+                        options.push((Value::Text("uv".into()), Value::Bool(false)));
+                        options.push((Value::Text("clientPin".into()), Value::Bool(false)));
+                        map.push((
+                            Value::Integer(CTAP2_GET_INFO_OPTIONS.into()),
+                            Value::Map(options),
+                        ));
+                        // 10: algorithms
+                        map.push((
+                            Value::Integer(CTAP2_GET_INFO_ALGORITHMS.into()),
+                            Value::Array(vec![Value::Map(vec![
+                                (Value::Text("type".into()), Value::Text("public-key".into())),
+                                (
+                                    Value::Text("alg".into()),
+                                    Value::Integer(COSE_ALGORITHM_EDDSA.into()),
+                                ),
+                            ])]),
+                        ));
 
                         let mut payload = Vec::new();
-                        payload.push(0x00); // Status: CTAP2_OK
+                        payload.push(CTAP2_STATUS_OK);
                         ciborium::ser::into_writer(&Value::Map(map), &mut payload)?;
 
                         let response = CtapHidMessage {
@@ -258,16 +370,25 @@ impl UhidAuthenticator {
                         };
                         self.send_message(response)?;
                     }
-                    0x01 => {
+                    ctap2_command::MAKE_CREDENTIAL => {
                         // authenticatorMakeCredential
                         info!("CTAP2 Command: authenticatorMakeCredential");
+                        if !Self::confirm_user_presence("Register this passkey?")? {
+                            warn!("User denied authenticatorMakeCredential");
+                            self.send_cbor_status(message.cid, CTAP2_STATUS_OPERATION_DENIED)?;
+                            return Ok(());
+                        }
 
                         let mut rng = rand::thread_rng();
                         let signing_key = SigningKey::generate(&mut rng);
                         let public_key = signing_key.verifying_key();
+                        let rp_id = Self::make_credential_rp_id(&message.payload)?
+                            .unwrap_or_else(|| "unknown".into());
+                        let rp_id_hash = Sha256::digest(rp_id.as_bytes());
+                        info!("MakeCredential rp.id={}", rp_id);
 
                         let mut auth_data = Vec::new();
-                        auth_data.extend_from_slice(&[0u8; 32]); // rpIdHash
+                        auth_data.extend_from_slice(&rp_id_hash);
                         auth_data.push(0b01000001); // flags
                         auth_data.extend_from_slice(&[0u8; 4]); // signCount
                         auth_data.extend_from_slice(&[0u8; 16]); // aaguid
@@ -277,11 +398,20 @@ impl UhidAuthenticator {
                         auth_data.extend_from_slice(cred_id);
 
                         let mut cose_key = Vec::new();
-                        cose_key.push((Value::Integer(1.into()), Value::Integer(1.into()))); // kty: OKP
-                        cose_key.push((Value::Integer(3.into()), Value::Integer((-8).into()))); // alg: EdDSA
-                        cose_key.push((Value::Integer((-1).into()), Value::Integer(6.into()))); // crv: Ed25519
                         cose_key.push((
-                            Value::Integer((-2).into()),
+                            Value::Integer(COSE_KEY_TYPE.into()),
+                            Value::Integer(COSE_KEY_TYPE_OKP.into()),
+                        ));
+                        cose_key.push((
+                            Value::Integer(COSE_KEY_ALGORITHM.into()),
+                            Value::Integer(COSE_ALGORITHM_EDDSA.into()),
+                        ));
+                        cose_key.push((
+                            Value::Integer(COSE_KEY_CURVE.into()),
+                            Value::Integer(COSE_CURVE_ED25519.into()),
+                        ));
+                        cose_key.push((
+                            Value::Integer(COSE_KEY_X_COORDINATE.into()),
                             Value::Bytes(public_key.to_bytes().to_vec()),
                         )); // x
 
@@ -290,12 +420,21 @@ impl UhidAuthenticator {
                         auth_data.extend_from_slice(&cose_buf);
 
                         let mut attestation = Vec::new();
-                        attestation.push((Value::Text("fmt".into()), Value::Text("none".into())));
-                        attestation.push((Value::Text("attStmt".into()), Value::Map(vec![])));
-                        attestation.push((Value::Text("authData".into()), Value::Bytes(auth_data)));
+                        attestation.push((
+                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT.into()),
+                            Value::Text("none".into()),
+                        ));
+                        attestation.push((
+                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA.into()),
+                            Value::Bytes(auth_data),
+                        ));
+                        attestation.push((
+                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT.into()),
+                            Value::Map(vec![]),
+                        ));
 
                         let mut payload = Vec::new();
-                        payload.push(0x00); // Status: CTAP2_OK
+                        payload.push(CTAP2_STATUS_OK);
                         ciborium::ser::into_writer(&Value::Map(attestation), &mut payload)?;
 
                         let response = CtapHidMessage {
@@ -304,6 +443,21 @@ impl UhidAuthenticator {
                             payload,
                         };
                         self.send_message(response)?;
+                    }
+                    ctap2_command::GET_ASSERTION => {
+                        warn!("CTAP2 Command authenticatorGetAssertion is not implemented");
+                    }
+                    ctap2_command::CLIENT_PIN => {
+                        warn!("CTAP2 Command authenticatorClientPIN is not implemented");
+                    }
+                    ctap2_command::SELECTION => {
+                        info!("CTAP2 Command: authenticatorSelection");
+                        let status = if Self::confirm_user_presence("Use this authenticator?")? {
+                            CTAP2_STATUS_OK
+                        } else {
+                            CTAP2_STATUS_OPERATION_DENIED
+                        };
+                        self.send_cbor_status(message.cid, status)?;
                     }
                     _ => {
                         warn!("Unhandled CTAP2 command: 0x{:02x}", ctap_cmd);
@@ -315,6 +469,125 @@ impl UhidAuthenticator {
             }
         }
         Ok(())
+    }
+
+    fn handle_u2f_msg(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {
+        info!("Handling CTAP_HID_MSG");
+
+        let instruction = message.payload.get(1).copied();
+        let parameter_1 = message.payload.get(2).copied();
+        let mut payload = Vec::new();
+
+        match (instruction, parameter_1) {
+            (Some(U2F_APDU_VERSION), _) => {
+                info!("U2F APDU VERSION");
+                payload.extend_from_slice(b"U2F_V2");
+                payload.extend_from_slice(&APDU_SW_NO_ERROR);
+            }
+            (Some(U2F_APDU_REGISTER), Some(U2F_REGISTER_PROBE_P1)) => {
+                info!("Chrome U2F register probe");
+                if Self::confirm_user_presence("Allow Chrome's registration presence probe?")? {
+                    payload.extend_from_slice(&Self::dummy_u2f_register_response());
+                } else {
+                    payload.extend_from_slice(&APDU_SW_CONDITIONS_NOT_SATISFIED);
+                }
+            }
+            (Some(U2F_APDU_REGISTER), _) => {
+                warn!("U2F APDU REGISTER is not implemented");
+                payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
+            }
+            (Some(ins), _) => {
+                warn!("Unhandled U2F APDU instruction: 0x{:02x}", ins);
+                payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
+            }
+            (None, _) => {
+                warn!("U2F APDU payload too short");
+                payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
+            }
+        }
+
+        let response = CtapHidMessage {
+            cid: message.cid,
+            cmd: command::MSG,
+            payload,
+        };
+        self.send_message(response)
+    }
+
+    fn dummy_u2f_register_response() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.push(U2F_REGISTER_RESPONSE_RESERVED);
+
+        let mut public_key = [0u8; U2F_PUBLIC_KEY_LEN];
+        public_key[0] = 0x04;
+        public_key[1..].fill(0x42);
+        response.extend_from_slice(&public_key);
+
+        response.push(U2F_DUMMY_KEY_HANDLE.len() as u8);
+        response.extend_from_slice(U2F_DUMMY_KEY_HANDLE);
+        response.extend_from_slice(U2F_DUMMY_ATTESTATION_CERT_DER);
+        response.extend_from_slice(U2F_DUMMY_SIGNATURE_DER);
+        response.extend_from_slice(&APDU_SW_NO_ERROR);
+        response
+    }
+
+    fn make_credential_rp_id(payload: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
+        if payload.len() < 2 {
+            return Ok(None);
+        }
+
+        let request: Value = ciborium::de::from_reader(&payload[1..])?;
+        let Value::Map(entries) = request else {
+            return Ok(None);
+        };
+
+        for (key, value) in entries {
+            if key != Value::Integer(CTAP2_MAKE_CREDENTIAL_RP.into()) {
+                continue;
+            }
+
+            let Value::Map(rp_entries) = value else {
+                return Ok(None);
+            };
+
+            for (rp_key, rp_value) in rp_entries {
+                if rp_key == Value::Text("id".into()) {
+                    if let Value::Text(rp_id) = rp_value {
+                        return Ok(Some(rp_id));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn send_cbor_status(&mut self, cid: u32, status: u8) -> Result<(), Box<dyn Error>> {
+        let response = CtapHidMessage {
+            cid,
+            cmd: command::CBOR,
+            payload: vec![status],
+        };
+        self.send_message(response)
+    }
+
+    fn confirm_user_presence(prompt: &str) -> Result<bool, Box<dyn Error>> {
+        loop {
+            print!("{prompt} [y/n]: ");
+            io::stdout().flush()?;
+
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => return Ok(true),
+                "n" | "no" => return Ok(false),
+                _ => {
+                    println!("Please answer y or n.");
+                }
+            }
+        }
     }
 
     fn send_message(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {

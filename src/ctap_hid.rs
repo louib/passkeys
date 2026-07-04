@@ -9,10 +9,11 @@ pub const CTAP_HID_REPORT_SIZE: usize = 64;
 
 /// CTAP HID Command identifiers.
 pub mod command {
+    pub const PING: u8 = 0x81;
     pub const MSG: u8 = 0x83;
     pub const CBOR: u8 = 0x90;
     pub const INIT: u8 = 0x86;
-    pub const WINK: u8 = 0x81;
+    pub const WINK: u8 = 0x88;
     pub const LOCK: u8 = 0x84;
     pub const CANCEL: u8 = 0x91;
     pub const KEEPALIVE: u8 = 0xbb;
