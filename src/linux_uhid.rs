@@ -4,6 +4,7 @@ use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,10 +30,10 @@ const CTAP2_GET_INFO_VERSIONS: i64 = 1;
 const CTAP2_GET_INFO_AAGUID: i64 = 3;
 /// CTAP2 authenticatorGetInfo response key: supported authenticator options.
 const CTAP2_GET_INFO_OPTIONS: i64 = 4;
-/// CTAP2 authenticatorGetInfo response key: supported credential algorithms.
-const CTAP2_GET_INFO_ALGORITHMS: i64 = 10;
 /// CTAP2 authenticatorMakeCredential request key: relying party entity.
 const CTAP2_MAKE_CREDENTIAL_RP: i64 = 2;
+/// CTAP2 authenticatorMakeCredential request key: accepted credential parameters.
+const CTAP2_MAKE_CREDENTIAL_PUB_KEY_CRED_PARAMS: i64 = 4;
 /// CTAP2 authenticatorMakeCredential response key: attestation statement format.
 const CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT: i64 = 1;
 /// CTAP2 authenticatorMakeCredential response key: authenticator data.
@@ -41,6 +42,8 @@ const CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA: i64 = 2;
 const CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT: i64 = 3;
 const CTAP2_VERSION_FIDO_2_0: &str = "FIDO_2_0";
 const CTAP2_STATUS_OK: u8 = 0x00;
+const CTAP2_STATUS_MISSING_PARAMETER: u8 = 0x14;
+const CTAP2_STATUS_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_STATUS_OPERATION_DENIED: u8 = 0x27;
 
 /// COSE key parameter: key type (`kty`).
@@ -55,44 +58,17 @@ const COSE_KEY_X_COORDINATE: i64 = -2;
 const COSE_KEY_TYPE_OKP: i64 = 1;
 /// COSE algorithm value for EdDSA.
 const COSE_ALGORITHM_EDDSA: i64 = -8;
-/// Algorithms advertised during protocol debugging.
-///
-/// Most of these are not implemented. Advertising them is deliberately
-/// non-compliant and only helps determine whether the relying party filters
-/// this authenticator because it normally advertises EdDSA alone.
-const DIAGNOSTIC_ADVERTISED_ALGORITHMS: &[i64] = &[
-    -7,   // ES256
-    -8,   // EdDSA (the only algorithm currently implemented)
-    -35,  // ES384
-    -36,  // ES512
-    -37,  // PS256
-    -38,  // PS384
-    -39,  // PS512
-    -257, // RS256
-    -258, // RS384
-    -259, // RS512
-];
 /// COSE curve value for Ed25519.
 const COSE_CURVE_ED25519: i64 = 6;
-/// U2F APDU instruction: register.
 const U2F_APDU_REGISTER: u8 = 0x01;
-/// U2F APDU instruction: authenticate.
 const U2F_APDU_AUTHENTICATE: u8 = 0x02;
-/// U2F APDU instruction: version.
 const U2F_APDU_VERSION: u8 = 0x03;
-/// Chrome's synthetic U2F register probe uses P1=0x03.
-const U2F_REGISTER_PROBE_P1: u8 = 0x03;
-/// APDU status word: command completed successfully.
+const U2F_REGISTER_P1_USER_PRESENCE: u8 = 0x03;
 const APDU_SW_NO_ERROR: [u8; 2] = [0x90, 0x00];
-/// APDU status word: user presence or similar condition is not currently satisfied.
 const APDU_SW_CONDITIONS_NOT_SATISFIED: [u8; 2] = [0x69, 0x85];
-/// APDU status word: instruction is not supported.
 const APDU_SW_INS_NOT_SUPPORTED: [u8; 2] = [0x6d, 0x00];
-/// APDU status word used by U2F for an unknown or invalid key handle.
 const APDU_SW_WRONG_DATA: [u8; 2] = [0x6a, 0x80];
-/// U2F register response reserved byte.
 const U2F_REGISTER_RESPONSE_RESERVED: u8 = 0x05;
-/// U2F public keys are uncompressed P-256 points.
 const U2F_PUBLIC_KEY_LEN: usize = 65;
 const U2F_DUMMY_KEY_HANDLE: &[u8] = b"chrome-presence-probe";
 const U2F_DUMMY_ATTESTATION_CERT_DER: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x00];
@@ -203,6 +179,14 @@ struct UhidEvent {
 pub struct UhidAuthenticator {
     file: File,
     reassembler: CtapHidReassembler,
+    credentials: HashMap<Vec<u8>, CredentialRecord>,
+}
+
+#[allow(dead_code)] // Consumed by authenticatorGetAssertion in the next POC milestone.
+struct CredentialRecord {
+    rp_id: String,
+    signing_key: SigningKey,
+    sign_count: u32,
 }
 
 impl UhidAuthenticator {
@@ -239,12 +223,13 @@ impl UhidAuthenticator {
         Ok(Self {
             file,
             reassembler: CtapHidReassembler::new(),
+            credentials: HashMap::new(),
         })
     }
 
     /// Listens for HID events from the kernel and logs them.
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        info!("Listening for HID events. Use https://webauthn.io to test.");
+        info!("Listening for HID events.");
 
         let mut buf = vec![0u8; mem::size_of::<UhidEvent>()];
 
@@ -334,7 +319,10 @@ impl UhidAuthenticator {
                 self.send_message(response)?;
             }
             command::MSG => {
-                self.handle_u2f_msg(message)?;
+                // Chromium may still issue U2F compatibility probes after
+                // observing NMSG. Handle them so one probe does not abort
+                // discovery of the CTAP2 authenticator.
+                self.handle_u2f_compatibility_message(message)?;
             }
             command::CBOR => {
                 info!("Handling CTAP_HID_CBOR");
@@ -348,47 +336,11 @@ impl UhidAuthenticator {
                     ctap2_command::GET_INFO => {
                         // authenticatorGetInfo
                         info!("CTAP2 Command: authenticatorGetInfo");
-
-                        let mut map = Vec::new();
-                        // 1: versions
-                        map.push((
-                            Value::Integer(CTAP2_GET_INFO_VERSIONS.into()),
-                            Value::Array(vec![Value::Text(CTAP2_VERSION_FIDO_2_0.into())]),
-                        ));
-                        // 3: aaguid (16 bytes)
-                        map.push((
-                            Value::Integer(CTAP2_GET_INFO_AAGUID.into()),
-                            Value::Bytes(vec![0u8; 16]),
-                        ));
-                        // 4: options
-                        let mut options = Vec::new();
-                        options.push((Value::Text("rk".into()), Value::Bool(false)));
-                        options.push((Value::Text("up".into()), Value::Bool(true)));
-                        map.push((
-                            Value::Integer(CTAP2_GET_INFO_OPTIONS.into()),
-                            Value::Map(options),
-                        ));
-                        // 10: algorithms
-                        let algorithms = DIAGNOSTIC_ADVERTISED_ALGORITHMS
-                            .iter()
-                            .map(|algorithm| {
-                                Value::Map(vec![
-                                    (Value::Text("type".into()), Value::Text("public-key".into())),
-                                    (
-                                        Value::Text("alg".into()),
-                                        Value::Integer((*algorithm).into()),
-                                    ),
-                                ])
-                            })
-                            .collect();
-                        map.push((
-                            Value::Integer(CTAP2_GET_INFO_ALGORITHMS.into()),
-                            Value::Array(algorithms),
-                        ));
-
-                        let mut payload = Vec::new();
-                        payload.push(CTAP2_STATUS_OK);
-                        ciborium::ser::into_writer(&Value::Map(map), &mut payload)?;
+                        let payload = Self::get_info_payload()?;
+                        info!(
+                            "GetInfo response: versions=[{}], algorithms=<omitted>, options={{rk:false, up:true}}",
+                            CTAP2_VERSION_FIDO_2_0
+                        );
 
                         let response = CtapHidMessage {
                             cid: message.cid,
@@ -400,6 +352,21 @@ impl UhidAuthenticator {
                     ctap2_command::MAKE_CREDENTIAL => {
                         // authenticatorMakeCredential
                         info!("CTAP2 Command: authenticatorMakeCredential");
+                        let algorithms = Self::make_credential_algorithms(&message.payload)?;
+                        info!("MakeCredential requested algorithms={algorithms:?}");
+                        if !algorithms.contains(&COSE_ALGORITHM_EDDSA) {
+                            warn!(
+                                "MakeCredential does not offer supported algorithm {}",
+                                COSE_ALGORITHM_EDDSA
+                            );
+                            self.send_cbor_status(message.cid, CTAP2_STATUS_UNSUPPORTED_ALGORITHM)?;
+                            return Ok(());
+                        }
+                        let Some(rp_id) = Self::make_credential_rp_id(&message.payload)? else {
+                            warn!("MakeCredential request is missing rp.id");
+                            self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
+                            return Ok(());
+                        };
                         if !Self::confirm_user_presence("Register this passkey?")? {
                             warn!("User denied authenticatorMakeCredential");
                             self.send_cbor_status(message.cid, CTAP2_STATUS_OPERATION_DENIED)?;
@@ -409,60 +376,29 @@ impl UhidAuthenticator {
                         let mut rng = rand::thread_rng();
                         let signing_key = SigningKey::generate(&mut rng);
                         let public_key = signing_key.verifying_key();
-                        let rp_id = Self::make_credential_rp_id(&message.payload)?
-                            .unwrap_or_else(|| "unknown".into());
-                        let rp_id_hash = Sha256::digest(rp_id.as_bytes());
                         info!("MakeCredential rp.id={}", rp_id);
 
-                        let mut auth_data = Vec::new();
-                        auth_data.extend_from_slice(&rp_id_hash);
-                        auth_data.push(0b01000001); // flags
-                        auth_data.extend_from_slice(&[0u8; 4]); // signCount
-                        auth_data.extend_from_slice(&[0u8; 16]); // aaguid
+                        let mut credential_id = vec![0u8; 32];
+                        rng.fill_bytes(&mut credential_id);
+                        let payload = Self::make_credential_response(
+                            &rp_id,
+                            &credential_id,
+                            public_key.to_bytes(),
+                        )?;
 
-                        let cred_id = b"dummy-credential-id";
-                        auth_data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
-                        auth_data.extend_from_slice(cred_id);
-
-                        let mut cose_key = Vec::new();
-                        cose_key.push((
-                            Value::Integer(COSE_KEY_TYPE.into()),
-                            Value::Integer(COSE_KEY_TYPE_OKP.into()),
-                        ));
-                        cose_key.push((
-                            Value::Integer(COSE_KEY_ALGORITHM.into()),
-                            Value::Integer(COSE_ALGORITHM_EDDSA.into()),
-                        ));
-                        cose_key.push((
-                            Value::Integer(COSE_KEY_CURVE.into()),
-                            Value::Integer(COSE_CURVE_ED25519.into()),
-                        ));
-                        cose_key.push((
-                            Value::Integer(COSE_KEY_X_COORDINATE.into()),
-                            Value::Bytes(public_key.to_bytes().to_vec()),
-                        )); // x
-
-                        let mut cose_buf = Vec::new();
-                        ciborium::ser::into_writer(&Value::Map(cose_key), &mut cose_buf)?;
-                        auth_data.extend_from_slice(&cose_buf);
-
-                        let mut attestation = Vec::new();
-                        attestation.push((
-                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT.into()),
-                            Value::Text("none".into()),
-                        ));
-                        attestation.push((
-                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA.into()),
-                            Value::Bytes(auth_data),
-                        ));
-                        attestation.push((
-                            Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT.into()),
-                            Value::Map(vec![]),
-                        ));
-
-                        let mut payload = Vec::new();
-                        payload.push(CTAP2_STATUS_OK);
-                        ciborium::ser::into_writer(&Value::Map(attestation), &mut payload)?;
+                        self.credentials.insert(
+                            credential_id.clone(),
+                            CredentialRecord {
+                                rp_id,
+                                signing_key,
+                                sign_count: 0,
+                            },
+                        );
+                        info!(
+                            "Stored credential id={:02x?}, total_credentials={}",
+                            credential_id,
+                            self.credentials.len()
+                        );
 
                         let response = CtapHidMessage {
                             cid: message.cid,
@@ -498,73 +434,142 @@ impl UhidAuthenticator {
         Ok(())
     }
 
-    fn handle_u2f_msg(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {
-        info!("Handling CTAP_HID_MSG");
+    fn get_info_payload() -> Result<Vec<u8>, Box<dyn Error>> {
+        let map = vec![
+            (
+                Value::Integer(CTAP2_GET_INFO_VERSIONS.into()),
+                Value::Array(vec![Value::Text(CTAP2_VERSION_FIDO_2_0.into())]),
+            ),
+            (
+                Value::Integer(CTAP2_GET_INFO_AAGUID.into()),
+                Value::Bytes(vec![0u8; 16]),
+            ),
+            (
+                Value::Integer(CTAP2_GET_INFO_OPTIONS.into()),
+                Value::Map(vec![
+                    (Value::Text("rk".into()), Value::Bool(false)),
+                    (Value::Text("up".into()), Value::Bool(true)),
+                ]),
+            ),
+        ];
 
+        let mut payload = vec![CTAP2_STATUS_OK];
+        ciborium::ser::into_writer(&Value::Map(map), &mut payload)?;
+        Ok(payload)
+    }
+
+    fn handle_u2f_compatibility_message(
+        &mut self,
+        message: CtapHidMessage,
+    ) -> Result<(), Box<dyn Error>> {
+        info!("Handling CTAP_HID_MSG compatibility request");
         let instruction = message.payload.get(1).copied();
         let parameter_1 = message.payload.get(2).copied();
         let mut payload = Vec::new();
 
         match (instruction, parameter_1) {
             (Some(U2F_APDU_VERSION), _) => {
-                info!("U2F APDU VERSION");
                 payload.extend_from_slice(b"U2F_V2");
                 payload.extend_from_slice(&APDU_SW_NO_ERROR);
             }
             (Some(U2F_APDU_AUTHENTICATE), _) => {
-                // This CTAP2-only POC has no U2F credentials. Browsers may
-                // nevertheless send an AUTHENTICATE request with a synthetic
-                // key handle while discovering/selecting an authenticator.
-                // U2F clients understand SW_WRONG_DATA as "not my key" and
-                // can continue trying the CTAP2 registration path.
-                info!("U2F APDU AUTHENTICATE: rejecting unknown key handle");
+                info!("U2F compatibility credential probe: unknown key handle");
                 payload.extend_from_slice(&APDU_SW_WRONG_DATA);
             }
-            (Some(U2F_APDU_REGISTER), Some(U2F_REGISTER_PROBE_P1)) => {
-                info!("Chrome U2F register probe");
-                if Self::confirm_user_presence("Allow Chrome's registration presence probe?")? {
+            (Some(U2F_APDU_REGISTER), Some(U2F_REGISTER_P1_USER_PRESENCE)) => {
+                info!("Chromium U2F compatibility registration request");
+                if Self::confirm_user_presence("Allow Chromium's compatibility request?")? {
                     payload.extend_from_slice(&Self::dummy_u2f_register_response());
                 } else {
                     payload.extend_from_slice(&APDU_SW_CONDITIONS_NOT_SATISFIED);
                 }
             }
             (Some(U2F_APDU_REGISTER), _) => {
-                warn!("U2F APDU REGISTER is not implemented");
                 payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
             }
-            (Some(ins), _) => {
-                warn!("Unhandled U2F APDU instruction: 0x{:02x}", ins);
-                payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
-            }
-            (None, _) => {
-                warn!("U2F APDU payload too short");
-                payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED);
-            }
+            _ => payload.extend_from_slice(&APDU_SW_INS_NOT_SUPPORTED),
         }
 
-        let response = CtapHidMessage {
+        self.send_message(CtapHidMessage {
             cid: message.cid,
             cmd: command::MSG,
             payload,
-        };
-        self.send_message(response)
+        })
     }
 
     fn dummy_u2f_register_response() -> Vec<u8> {
         let mut response = Vec::new();
         response.push(U2F_REGISTER_RESPONSE_RESERVED);
-
         let mut public_key = [0u8; U2F_PUBLIC_KEY_LEN];
         public_key[0] = 0x04;
         public_key[1..].fill(0x42);
         response.extend_from_slice(&public_key);
-
         response.push(U2F_DUMMY_KEY_HANDLE.len() as u8);
         response.extend_from_slice(U2F_DUMMY_KEY_HANDLE);
         response.extend_from_slice(U2F_DUMMY_ATTESTATION_CERT_DER);
         response.extend_from_slice(U2F_DUMMY_SIGNATURE_DER);
         response.extend_from_slice(&APDU_SW_NO_ERROR);
         response
+    }
+
+    fn make_credential_response(
+        rp_id: &str,
+        credential_id: &[u8],
+        public_key: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut cose_buf = Vec::new();
+        ciborium::ser::into_writer(
+            &Value::Map(vec![
+                (
+                    Value::Integer(COSE_KEY_TYPE.into()),
+                    Value::Integer(COSE_KEY_TYPE_OKP.into()),
+                ),
+                (
+                    Value::Integer(COSE_KEY_ALGORITHM.into()),
+                    Value::Integer(COSE_ALGORITHM_EDDSA.into()),
+                ),
+                (
+                    Value::Integer(COSE_KEY_CURVE.into()),
+                    Value::Integer(COSE_CURVE_ED25519.into()),
+                ),
+                (
+                    Value::Integer(COSE_KEY_X_COORDINATE.into()),
+                    Value::Bytes(public_key.to_vec()),
+                ),
+            ]),
+            &mut cose_buf,
+        )?;
+
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(0x41); // UP | AT
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        let credential_id_len = u16::try_from(credential_id.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "credential ID is too long")
+        })?;
+        auth_data.extend_from_slice(&credential_id_len.to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        auth_data.extend_from_slice(&cose_buf);
+
+        let attestation = Value::Map(vec![
+            (
+                Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT.into()),
+                Value::Text("none".into()),
+            ),
+            (
+                Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA.into()),
+                Value::Bytes(auth_data),
+            ),
+            (
+                Value::Integer(CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT.into()),
+                Value::Map(vec![]),
+            ),
+        ]);
+
+        let mut payload = vec![CTAP2_STATUS_OK];
+        ciborium::ser::into_writer(&attestation, &mut payload)?;
+        Ok(payload)
     }
 
     fn make_credential_rp_id(payload: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
@@ -597,6 +602,44 @@ impl UhidAuthenticator {
         }
 
         Ok(None)
+    }
+
+    fn make_credential_algorithms(payload: &[u8]) -> Result<Vec<i64>, Box<dyn Error>> {
+        if payload.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let request: Value = ciborium::de::from_reader(&payload[1..])?;
+        let Value::Map(entries) = request else {
+            return Ok(Vec::new());
+        };
+
+        let Some(Value::Array(parameters)) = entries.into_iter().find_map(|(key, value)| {
+            (key == Value::Integer(CTAP2_MAKE_CREDENTIAL_PUB_KEY_CRED_PARAMS.into()))
+                .then_some(value)
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let algorithms = parameters
+            .into_iter()
+            .filter_map(|parameter| {
+                let Value::Map(fields) = parameter else {
+                    return None;
+                };
+                fields.into_iter().find_map(|(key, value)| {
+                    if key != Value::Text("alg".into()) {
+                        return None;
+                    }
+                    let Value::Integer(algorithm) = value else {
+                        return None;
+                    };
+                    i64::try_from(algorithm).ok()
+                })
+            })
+            .collect();
+
+        Ok(algorithms)
     }
 
     fn send_cbor_status(&mut self, cid: u32, status: u8) -> Result<(), Box<dyn Error>> {
@@ -664,5 +707,131 @@ impl UhidAuthenticator {
         }
         info!("Message sent successfully.");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_value<'a>(map: &'a [(Value, Value)], key: i64) -> &'a Value {
+        map.iter()
+            .find_map(|(candidate, value)| {
+                (candidate == &Value::Integer(key.into())).then_some(value)
+            })
+            .expect("GetInfo key should be present")
+    }
+
+    #[test]
+    fn get_info_omits_optional_algorithm_prefilter() {
+        let payload = UhidAuthenticator::get_info_payload().expect("GetInfo should encode");
+        assert_eq!(payload[0], CTAP2_STATUS_OK);
+
+        let value: Value =
+            ciborium::de::from_reader(&payload[1..]).expect("GetInfo CBOR should decode");
+        let Value::Map(map) = value else {
+            panic!("GetInfo response should be a map");
+        };
+        assert_eq!(map.len(), 3);
+        assert!(map.iter().all(|(key, _)| key != &Value::Integer(10.into())));
+    }
+
+    #[test]
+    fn parses_make_credential_algorithm_list() {
+        let request = Value::Map(vec![(
+            Value::Integer(CTAP2_MAKE_CREDENTIAL_PUB_KEY_CRED_PARAMS.into()),
+            Value::Array(vec![
+                Value::Map(vec![
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                    (Value::Text("alg".into()), Value::Integer((-7).into())),
+                ]),
+                Value::Map(vec![
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                    (
+                        Value::Text("alg".into()),
+                        Value::Integer(COSE_ALGORITHM_EDDSA.into()),
+                    ),
+                ]),
+            ]),
+        )]);
+        let mut payload = vec![ctap2_command::MAKE_CREDENTIAL];
+        ciborium::ser::into_writer(&request, &mut payload).expect("request should encode");
+
+        let algorithms = UhidAuthenticator::make_credential_algorithms(&payload)
+            .expect("algorithm list should parse");
+        assert_eq!(algorithms, vec![-7, COSE_ALGORITHM_EDDSA]);
+    }
+
+    #[test]
+    fn make_credential_response_contains_valid_ed25519_attested_data() {
+        let credential_id = [0x5a; 32];
+        let public_key = [0xa5; 32];
+        let payload =
+            UhidAuthenticator::make_credential_response("example.com", &credential_id, public_key)
+                .expect("response should encode");
+        assert_eq!(payload[0], CTAP2_STATUS_OK);
+
+        let response: Value =
+            ciborium::de::from_reader(&payload[1..]).expect("response CBOR should decode");
+        let Value::Map(response) = response else {
+            panic!("response should be a map");
+        };
+        assert_eq!(
+            map_value(&response, CTAP2_MAKE_CREDENTIAL_RESPONSE_FMT),
+            &Value::Text("none".into())
+        );
+        assert_eq!(
+            map_value(&response, CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT),
+            &Value::Map(vec![])
+        );
+
+        let Value::Bytes(auth_data) =
+            map_value(&response, CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA)
+        else {
+            panic!("authData should be a byte string");
+        };
+        assert_eq!(&auth_data[..32], Sha256::digest(b"example.com").as_slice());
+        assert_eq!(auth_data[32], 0x41);
+        assert_eq!(&auth_data[33..37], &[0; 4]);
+        assert_eq!(&auth_data[37..53], &[0; 16]);
+        assert_eq!(u16::from_be_bytes([auth_data[53], auth_data[54]]), 32);
+        assert_eq!(&auth_data[55..87], &credential_id);
+
+        let cose_key: Value =
+            ciborium::de::from_reader(&auth_data[87..]).expect("COSE key should decode");
+        let Value::Map(cose_key) = cose_key else {
+            panic!("COSE key should be a map");
+        };
+        assert_eq!(
+            map_value(&cose_key, COSE_KEY_TYPE),
+            &Value::Integer(COSE_KEY_TYPE_OKP.into())
+        );
+        assert_eq!(
+            map_value(&cose_key, COSE_KEY_ALGORITHM),
+            &Value::Integer(COSE_ALGORITHM_EDDSA.into())
+        );
+        assert_eq!(
+            map_value(&cose_key, COSE_KEY_CURVE),
+            &Value::Integer(COSE_CURVE_ED25519.into())
+        );
+        assert_eq!(
+            map_value(&cose_key, COSE_KEY_X_COORDINATE),
+            &Value::Bytes(public_key.to_vec())
+        );
+    }
+
+    #[test]
+    fn advertised_hid_capabilities_are_cbor_without_msg() {
+        let capabilities = CTAP_HID_CAPABILITY_CBOR | CTAP_HID_CAPABILITY_NMSG;
+        assert_eq!(capabilities, 0x0c);
+        assert_ne!(capabilities & CTAP_HID_CAPABILITY_CBOR, 0);
+        assert_ne!(capabilities & CTAP_HID_CAPABILITY_NMSG, 0);
+    }
+
+    #[test]
+    fn dummy_u2f_compatibility_response_has_success_status() {
+        let response = UhidAuthenticator::dummy_u2f_register_response();
+        assert_eq!(response[0], U2F_REGISTER_RESPONSE_RESERVED);
+        assert_eq!(&response[response.len() - 2..], &APDU_SW_NO_ERROR);
     }
 }
