@@ -1,6 +1,6 @@
 use crate::ctap_hid::{CtapHidMessage, CtapHidPacket, CtapHidReassembler, command};
 use ciborium::value::Value;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use log::{info, warn};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -45,6 +45,15 @@ const CTAP2_STATUS_OK: u8 = 0x00;
 const CTAP2_STATUS_MISSING_PARAMETER: u8 = 0x14;
 const CTAP2_STATUS_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_STATUS_OPERATION_DENIED: u8 = 0x27;
+const CTAP2_STATUS_NO_CREDENTIALS: u8 = 0x2e;
+
+const CTAP2_GET_ASSERTION_RP_ID: i64 = 1;
+const CTAP2_GET_ASSERTION_CLIENT_DATA_HASH: i64 = 2;
+const CTAP2_GET_ASSERTION_ALLOW_LIST: i64 = 3;
+const CTAP2_GET_ASSERTION_OPTIONS: i64 = 5;
+const CTAP2_GET_ASSERTION_RESPONSE_CREDENTIAL: i64 = 1;
+const CTAP2_GET_ASSERTION_RESPONSE_AUTH_DATA: i64 = 2;
+const CTAP2_GET_ASSERTION_RESPONSE_SIGNATURE: i64 = 3;
 
 /// COSE key parameter: key type (`kty`).
 const COSE_KEY_TYPE: i64 = 1;
@@ -187,6 +196,13 @@ struct CredentialRecord {
     rp_id: String,
     signing_key: SigningKey,
     sign_count: u32,
+}
+
+struct GetAssertionRequest {
+    rp_id: String,
+    client_data_hash: [u8; 32],
+    allow_list: Vec<Vec<u8>>,
+    user_presence: bool,
 }
 
 impl UhidAuthenticator {
@@ -408,7 +424,8 @@ impl UhidAuthenticator {
                         self.send_message(response)?;
                     }
                     ctap2_command::GET_ASSERTION => {
-                        warn!("CTAP2 Command authenticatorGetAssertion is not implemented");
+                        info!("CTAP2 Command: authenticatorGetAssertion");
+                        self.handle_get_assertion(message)?;
                     }
                     ctap2_command::CLIENT_PIN => {
                         warn!("CTAP2 Command authenticatorClientPIN is not implemented");
@@ -570,6 +587,150 @@ impl UhidAuthenticator {
         let mut payload = vec![CTAP2_STATUS_OK];
         ciborium::ser::into_writer(&attestation, &mut payload)?;
         Ok(payload)
+    }
+
+    fn handle_get_assertion(&mut self, message: CtapHidMessage) -> Result<(), Box<dyn Error>> {
+        let Some(request) = Self::parse_get_assertion_request(&message.payload)? else {
+            warn!("GetAssertion request is missing a required parameter");
+            self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
+            return Ok(());
+        };
+
+        info!(
+            "GetAssertion rp.id={}, allow_list_entries={}, up={}",
+            request.rp_id,
+            request.allow_list.len(),
+            request.user_presence
+        );
+
+        let credential_id = request.allow_list.iter().find(|credential_id| {
+            self.credentials
+                .get(*credential_id)
+                .is_some_and(|credential| credential.rp_id == request.rp_id)
+        });
+        let Some(credential_id) = credential_id.cloned() else {
+            warn!("GetAssertion found no matching credential");
+            self.send_cbor_status(message.cid, CTAP2_STATUS_NO_CREDENTIALS)?;
+            return Ok(());
+        };
+
+        if request.user_presence && !Self::confirm_user_presence("Authenticate this passkey?")? {
+            warn!("User denied authenticatorGetAssertion");
+            self.send_cbor_status(message.cid, CTAP2_STATUS_OPERATION_DENIED)?;
+            return Ok(());
+        }
+
+        let record = self
+            .credentials
+            .get_mut(&credential_id)
+            .expect("selected credential must still exist");
+        record.sign_count = record.sign_count.saturating_add(1);
+
+        let mut auth_data = Vec::with_capacity(37);
+        auth_data.extend_from_slice(&Sha256::digest(request.rp_id.as_bytes()));
+        auth_data.push(u8::from(request.user_presence));
+        auth_data.extend_from_slice(&record.sign_count.to_be_bytes());
+
+        let mut signed_data = auth_data.clone();
+        signed_data.extend_from_slice(&request.client_data_hash);
+        let signature = record.signing_key.sign(&signed_data).to_bytes().to_vec();
+
+        let response = Value::Map(vec![
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_CREDENTIAL.into()),
+                Value::Map(vec![
+                    (Value::Text("id".into()), Value::Bytes(credential_id)),
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                ]),
+            ),
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_AUTH_DATA.into()),
+                Value::Bytes(auth_data),
+            ),
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_SIGNATURE.into()),
+                Value::Bytes(signature),
+            ),
+        ]);
+        let mut payload = vec![CTAP2_STATUS_OK];
+        ciborium::ser::into_writer(&response, &mut payload)?;
+        info!(
+            "GetAssertion signed credential, up={}, sign_count={}",
+            request.user_presence, record.sign_count
+        );
+        self.send_message(CtapHidMessage {
+            cid: message.cid,
+            cmd: command::CBOR,
+            payload,
+        })
+    }
+
+    fn parse_get_assertion_request(
+        payload: &[u8],
+    ) -> Result<Option<GetAssertionRequest>, Box<dyn Error>> {
+        if payload.len() < 2 {
+            return Ok(None);
+        }
+        let Value::Map(entries) = ciborium::de::from_reader(&payload[1..])? else {
+            return Ok(None);
+        };
+
+        let mut rp_id = None;
+        let mut client_data_hash = None;
+        let mut allow_list = Vec::new();
+        let mut user_presence = true;
+
+        for (key, value) in entries {
+            if key == Value::Integer(CTAP2_GET_ASSERTION_RP_ID.into()) {
+                if let Value::Text(value) = value {
+                    rp_id = Some(value);
+                }
+            } else if key == Value::Integer(CTAP2_GET_ASSERTION_CLIENT_DATA_HASH.into()) {
+                if let Value::Bytes(value) = value {
+                    client_data_hash = value.try_into().ok();
+                }
+            } else if key == Value::Integer(CTAP2_GET_ASSERTION_ALLOW_LIST.into()) {
+                if let Value::Array(descriptors) = value {
+                    allow_list = descriptors
+                        .into_iter()
+                        .filter_map(Self::credential_descriptor_id)
+                        .collect();
+                }
+            } else if key == Value::Integer(CTAP2_GET_ASSERTION_OPTIONS.into()) {
+                if let Value::Map(options) = value {
+                    for (option, value) in options {
+                        if option == Value::Text("up".into()) {
+                            if let Value::Bool(value) = value {
+                                user_presence = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rp_id
+            .zip(client_data_hash)
+            .map(|(rp_id, client_data_hash)| GetAssertionRequest {
+                rp_id,
+                client_data_hash,
+                allow_list,
+                user_presence,
+            }))
+    }
+
+    fn credential_descriptor_id(value: Value) -> Option<Vec<u8>> {
+        let Value::Map(fields) = value else {
+            return None;
+        };
+        fields.into_iter().find_map(|(key, value)| {
+            if key == Value::Text("id".into()) {
+                if let Value::Bytes(id) = value {
+                    return Some(id);
+                }
+            }
+            None
+        })
     }
 
     fn make_credential_rp_id(payload: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
@@ -818,6 +979,45 @@ mod tests {
             map_value(&cose_key, COSE_KEY_X_COORDINATE),
             &Value::Bytes(public_key.to_vec())
         );
+    }
+
+    #[test]
+    fn parses_get_assertion_allow_list_and_silent_probe() {
+        let credential_id = vec![0x5a; 32];
+        let request = Value::Map(vec![
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_RP_ID.into()),
+                Value::Text("example.com".into()),
+            ),
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_CLIENT_DATA_HASH.into()),
+                Value::Bytes(vec![0xa5; 32]),
+            ),
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_ALLOW_LIST.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::Text("id".into()),
+                        Value::Bytes(credential_id.clone()),
+                    ),
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                ])]),
+            ),
+            (
+                Value::Integer(CTAP2_GET_ASSERTION_OPTIONS.into()),
+                Value::Map(vec![(Value::Text("up".into()), Value::Bool(false))]),
+            ),
+        ]);
+        let mut payload = vec![ctap2_command::GET_ASSERTION];
+        ciborium::ser::into_writer(&request, &mut payload).expect("request should encode");
+
+        let parsed = UhidAuthenticator::parse_get_assertion_request(&payload)
+            .expect("request should parse")
+            .expect("required parameters should be present");
+        assert_eq!(parsed.rp_id, "example.com");
+        assert_eq!(parsed.client_data_hash, [0xa5; 32]);
+        assert_eq!(parsed.allow_list, vec![credential_id]);
+        assert!(!parsed.user_presence);
     }
 
     #[test]
