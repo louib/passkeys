@@ -46,6 +46,11 @@ const CTAP2_STATUS_MISSING_PARAMETER: u8 = 0x14;
 const CTAP2_STATUS_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_STATUS_OPERATION_DENIED: u8 = 0x27;
 const CTAP2_STATUS_NO_CREDENTIALS: u8 = 0x2e;
+const CTAP2_STATUS_PIN_NOT_SET: u8 = 0x35;
+
+/// Firefox/authenticator-rs uses this synthetic RP for CTAP 2.0 device
+/// selection because CTAP 2.0 has no authenticatorSelection command.
+const FIREFOX_SELECTION_RP_ID: &str = "make.me.blink";
 
 const CTAP2_GET_ASSERTION_RP_ID: i64 = 1;
 const CTAP2_GET_ASSERTION_CLIENT_DATA_HASH: i64 = 2;
@@ -368,8 +373,33 @@ impl UhidAuthenticator {
                     ctap2_command::MAKE_CREDENTIAL => {
                         // authenticatorMakeCredential
                         info!("CTAP2 Command: authenticatorMakeCredential");
+                        let Some(rp_id) = Self::make_credential_rp_id(&message.payload)? else {
+                            warn!("MakeCredential request is missing rp.id");
+                            self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
+                            return Ok(());
+                        };
                         let algorithms = Self::make_credential_algorithms(&message.payload)?;
                         info!("MakeCredential requested algorithms={algorithms:?}");
+
+                        // Firefox's authenticator-rs sends a dummy ES256
+                        // MakeCredential request to every connected CTAP 2.0
+                        // authenticator when the user must choose a device. It
+                        // considers PIN_NOT_SET after presence a successful
+                        // selection and then sends the real RP request. Do not
+                        // create or retain a credential for this probe.
+                        if rp_id == FIREFOX_SELECTION_RP_ID {
+                            info!("Firefox CTAP2 device-selection probe");
+                            let status = if Self::confirm_user_presence(
+                                "Use this authenticator for Firefox?",
+                            )? {
+                                CTAP2_STATUS_PIN_NOT_SET
+                            } else {
+                                CTAP2_STATUS_OPERATION_DENIED
+                            };
+                            self.send_cbor_status(message.cid, status)?;
+                            return Ok(());
+                        }
+
                         if !algorithms.contains(&COSE_ALGORITHM_EDDSA) {
                             warn!(
                                 "MakeCredential does not offer supported algorithm {}",
@@ -378,11 +408,6 @@ impl UhidAuthenticator {
                             self.send_cbor_status(message.cid, CTAP2_STATUS_UNSUPPORTED_ALGORITHM)?;
                             return Ok(());
                         }
-                        let Some(rp_id) = Self::make_credential_rp_id(&message.payload)? else {
-                            warn!("MakeCredential request is missing rp.id");
-                            self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
-                            return Ok(());
-                        };
                         if !Self::confirm_user_presence("Register this passkey?")? {
                             warn!("User denied authenticatorMakeCredential");
                             self.send_cbor_status(message.cid, CTAP2_STATUS_OPERATION_DENIED)?;
@@ -921,6 +946,41 @@ mod tests {
         let algorithms = UhidAuthenticator::make_credential_algorithms(&payload)
             .expect("algorithm list should parse");
         assert_eq!(algorithms, vec![-7, COSE_ALGORITHM_EDDSA]);
+    }
+
+    #[test]
+    fn recognizes_firefox_device_selection_request_before_algorithm_filtering() {
+        let request = Value::Map(vec![
+            (
+                Value::Integer(CTAP2_MAKE_CREDENTIAL_RP.into()),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text(FIREFOX_SELECTION_RP_ID.into()),
+                )]),
+            ),
+            (
+                Value::Integer(CTAP2_MAKE_CREDENTIAL_PUB_KEY_CRED_PARAMS.into()),
+                Value::Array(vec![Value::Map(vec![(
+                    Value::Text("alg".into()),
+                    Value::Integer((-7).into()),
+                )])]),
+            ),
+        ]);
+        let mut payload = vec![ctap2_command::MAKE_CREDENTIAL];
+        ciborium::ser::into_writer(&request, &mut payload).expect("request should encode");
+
+        assert_eq!(
+            UhidAuthenticator::make_credential_rp_id(&payload)
+                .expect("RP should parse")
+                .as_deref(),
+            Some(FIREFOX_SELECTION_RP_ID)
+        );
+        assert_eq!(
+            UhidAuthenticator::make_credential_algorithms(&payload)
+                .expect("algorithms should parse"),
+            vec![-7]
+        );
+        assert_eq!(CTAP2_STATUS_PIN_NOT_SET, 0x35);
     }
 
     #[test]
