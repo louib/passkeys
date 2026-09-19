@@ -19,6 +19,9 @@ const UHID_DATA_MAX: usize = 4096;
 
 /// CTAP HID capability bit: authenticator supports CTAP2 CBOR commands.
 const CTAP_HID_CAPABILITY_CBOR: u8 = 0x04;
+/// CTAP HID capability bit: authenticator does not support legacy CTAP1/U2F
+/// messages over CTAPHID_MSG.
+const CTAP_HID_CAPABILITY_NMSG: u8 = 0x08;
 
 /// CTAP2 authenticatorGetInfo response key: supported protocol versions.
 const CTAP2_GET_INFO_VERSIONS: i64 = 1;
@@ -37,7 +40,6 @@ const CTAP2_MAKE_CREDENTIAL_RESPONSE_AUTH_DATA: i64 = 2;
 /// CTAP2 authenticatorMakeCredential response key: attestation statement.
 const CTAP2_MAKE_CREDENTIAL_RESPONSE_ATT_STMT: i64 = 3;
 const CTAP2_VERSION_FIDO_2_0: &str = "FIDO_2_0";
-const CTAP2_VERSION_FIDO_2_1_PRE: &str = "FIDO_2_1_PRE";
 const CTAP2_STATUS_OK: u8 = 0x00;
 const CTAP2_STATUS_OPERATION_DENIED: u8 = 0x27;
 
@@ -53,10 +55,29 @@ const COSE_KEY_X_COORDINATE: i64 = -2;
 const COSE_KEY_TYPE_OKP: i64 = 1;
 /// COSE algorithm value for EdDSA.
 const COSE_ALGORITHM_EDDSA: i64 = -8;
+/// Algorithms advertised during protocol debugging.
+///
+/// Most of these are not implemented. Advertising them is deliberately
+/// non-compliant and only helps determine whether the relying party filters
+/// this authenticator because it normally advertises EdDSA alone.
+const DIAGNOSTIC_ADVERTISED_ALGORITHMS: &[i64] = &[
+    -7,   // ES256
+    -8,   // EdDSA (the only algorithm currently implemented)
+    -35,  // ES384
+    -36,  // ES512
+    -37,  // PS256
+    -38,  // PS384
+    -39,  // PS512
+    -257, // RS256
+    -258, // RS384
+    -259, // RS512
+];
 /// COSE curve value for Ed25519.
 const COSE_CURVE_ED25519: i64 = 6;
 /// U2F APDU instruction: register.
 const U2F_APDU_REGISTER: u8 = 0x01;
+/// U2F APDU instruction: authenticate.
+const U2F_APDU_AUTHENTICATE: u8 = 0x02;
 /// U2F APDU instruction: version.
 const U2F_APDU_VERSION: u8 = 0x03;
 /// Chrome's synthetic U2F register probe uses P1=0x03.
@@ -67,6 +88,8 @@ const APDU_SW_NO_ERROR: [u8; 2] = [0x90, 0x00];
 const APDU_SW_CONDITIONS_NOT_SATISFIED: [u8; 2] = [0x69, 0x85];
 /// APDU status word: instruction is not supported.
 const APDU_SW_INS_NOT_SUPPORTED: [u8; 2] = [0x6d, 0x00];
+/// APDU status word used by U2F for an unknown or invalid key handle.
+const APDU_SW_WRONG_DATA: [u8; 2] = [0x6a, 0x80];
 /// U2F register response reserved byte.
 const U2F_REGISTER_RESPONSE_RESERVED: u8 = 0x05;
 /// U2F public keys are uncompressed P-256 points.
@@ -287,7 +310,10 @@ impl UhidAuthenticator {
                 response_payload.push(0x01); // Version major
                 response_payload.push(0x00); // Version minor
                 response_payload.push(0x00); // Version build
-                let capabilities = CTAP_HID_CAPABILITY_CBOR;
+                // This POC only implements CTAP2. Without NMSG, clients assume
+                // CTAP1/U2F is also available and send legacy APDU probes that
+                // this authenticator cannot answer correctly.
+                let capabilities = CTAP_HID_CAPABILITY_CBOR | CTAP_HID_CAPABILITY_NMSG;
                 response_payload.push(capabilities);
                 info!("CTAP_HID_INIT capabilities=0x{:02x}", capabilities);
 
@@ -327,10 +353,7 @@ impl UhidAuthenticator {
                         // 1: versions
                         map.push((
                             Value::Integer(CTAP2_GET_INFO_VERSIONS.into()),
-                            Value::Array(vec![
-                                Value::Text(CTAP2_VERSION_FIDO_2_0.into()),
-                                Value::Text(CTAP2_VERSION_FIDO_2_1_PRE.into()),
-                            ]),
+                            Value::Array(vec![Value::Text(CTAP2_VERSION_FIDO_2_0.into())]),
                         ));
                         // 3: aaguid (16 bytes)
                         map.push((
@@ -341,22 +364,26 @@ impl UhidAuthenticator {
                         let mut options = Vec::new();
                         options.push((Value::Text("rk".into()), Value::Bool(false)));
                         options.push((Value::Text("up".into()), Value::Bool(true)));
-                        options.push((Value::Text("uv".into()), Value::Bool(false)));
-                        options.push((Value::Text("clientPin".into()), Value::Bool(false)));
                         map.push((
                             Value::Integer(CTAP2_GET_INFO_OPTIONS.into()),
                             Value::Map(options),
                         ));
                         // 10: algorithms
+                        let algorithms = DIAGNOSTIC_ADVERTISED_ALGORITHMS
+                            .iter()
+                            .map(|algorithm| {
+                                Value::Map(vec![
+                                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                                    (
+                                        Value::Text("alg".into()),
+                                        Value::Integer((*algorithm).into()),
+                                    ),
+                                ])
+                            })
+                            .collect();
                         map.push((
                             Value::Integer(CTAP2_GET_INFO_ALGORITHMS.into()),
-                            Value::Array(vec![Value::Map(vec![
-                                (Value::Text("type".into()), Value::Text("public-key".into())),
-                                (
-                                    Value::Text("alg".into()),
-                                    Value::Integer(COSE_ALGORITHM_EDDSA.into()),
-                                ),
-                            ])]),
+                            Value::Array(algorithms),
                         ));
 
                         let mut payload = Vec::new();
@@ -483,6 +510,15 @@ impl UhidAuthenticator {
                 info!("U2F APDU VERSION");
                 payload.extend_from_slice(b"U2F_V2");
                 payload.extend_from_slice(&APDU_SW_NO_ERROR);
+            }
+            (Some(U2F_APDU_AUTHENTICATE), _) => {
+                // This CTAP2-only POC has no U2F credentials. Browsers may
+                // nevertheless send an AUTHENTICATE request with a synthetic
+                // key handle while discovering/selecting an authenticator.
+                // U2F clients understand SW_WRONG_DATA as "not my key" and
+                // can continue trying the CTAP2 registration path.
+                info!("U2F APDU AUTHENTICATE: rejecting unknown key handle");
+                payload.extend_from_slice(&APDU_SW_WRONG_DATA);
             }
             (Some(U2F_APDU_REGISTER), Some(U2F_REGISTER_PROBE_P1)) => {
                 info!("Chrome U2F register probe");
