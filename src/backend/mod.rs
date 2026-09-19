@@ -4,11 +4,13 @@
 //! keys, and Ed25519 signatures. Private key material and signing ceremony
 //! details remain inside an implementation of [`CredentialBackend`].
 
+mod frost;
 mod local_ed25519;
 
 use std::error::Error;
 use std::fmt;
 
+pub use frost::FrostBackend;
 pub use local_ed25519::LocalEd25519Backend;
 
 /// Opaque backend-owned identifier exposed to WebAuthn as a credential ID.
