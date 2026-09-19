@@ -1,10 +1,10 @@
+use crate::authenticator::{AssertionRequest, AuthenticatorService, RegistrationRequest};
+use crate::backend::{CredentialBackend, LocalEd25519Backend};
 use crate::ctap_hid::{CtapHidMessage, CtapHidPacket, CtapHidReassembler, command};
 use ciborium::value::Value;
-use ed25519_dalek::{Signer, SigningKey};
 use log::{info, warn};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -32,6 +32,8 @@ const CTAP2_GET_INFO_AAGUID: i64 = 3;
 const CTAP2_GET_INFO_OPTIONS: i64 = 4;
 /// CTAP2 authenticatorMakeCredential request key: relying party entity.
 const CTAP2_MAKE_CREDENTIAL_RP: i64 = 2;
+/// CTAP2 authenticatorMakeCredential request key: user entity.
+const CTAP2_MAKE_CREDENTIAL_USER: i64 = 3;
 /// CTAP2 authenticatorMakeCredential request key: accepted credential parameters.
 const CTAP2_MAKE_CREDENTIAL_PUB_KEY_CRED_PARAMS: i64 = 4;
 /// CTAP2 authenticatorMakeCredential response key: attestation statement format.
@@ -193,14 +195,7 @@ struct UhidEvent {
 pub struct UhidAuthenticator {
     file: File,
     reassembler: CtapHidReassembler,
-    credentials: HashMap<Vec<u8>, CredentialRecord>,
-}
-
-#[allow(dead_code)] // Consumed by authenticatorGetAssertion in the next POC milestone.
-struct CredentialRecord {
-    rp_id: String,
-    signing_key: SigningKey,
-    sign_count: u32,
+    authenticator: AuthenticatorService,
 }
 
 struct GetAssertionRequest {
@@ -213,6 +208,12 @@ struct GetAssertionRequest {
 impl UhidAuthenticator {
     /// Creates a new virtual authenticator by opening /dev/uhid.
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        Self::with_backend(Box::new(LocalEd25519Backend::default()))
+    }
+
+    /// Creates a virtual authenticator backed by an injected credential
+    /// implementation. The UHID and CTAP layers never access private keys.
+    pub fn with_backend(backend: Box<dyn CredentialBackend>) -> Result<Self, Box<dyn Error>> {
         info!("Opening /dev/uhid (Pure-Rust)...");
         let mut file = OpenOptions::new()
             .read(true)
@@ -244,7 +245,7 @@ impl UhidAuthenticator {
         Ok(Self {
             file,
             reassembler: CtapHidReassembler::new(),
-            credentials: HashMap::new(),
+            authenticator: AuthenticatorService::new(backend),
         })
     }
 
@@ -378,6 +379,11 @@ impl UhidAuthenticator {
                             self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
                             return Ok(());
                         };
+                        let Some(user_id) = Self::make_credential_user_id(&message.payload)? else {
+                            warn!("MakeCredential request is missing user.id");
+                            self.send_cbor_status(message.cid, CTAP2_STATUS_MISSING_PARAMETER)?;
+                            return Ok(());
+                        };
                         let algorithms = Self::make_credential_algorithms(&message.payload)?;
                         info!("MakeCredential requested algorithms={algorithms:?}");
 
@@ -414,32 +420,17 @@ impl UhidAuthenticator {
                             return Ok(());
                         }
 
-                        let mut rng = rand::thread_rng();
-                        let signing_key = SigningKey::generate(&mut rng);
-                        let public_key = signing_key.verifying_key();
                         info!("MakeCredential rp.id={}", rp_id);
-
-                        let mut credential_id = vec![0u8; 32];
-                        rng.fill_bytes(&mut credential_id);
+                        let registration = self.authenticator.register(RegistrationRequest {
+                            rp_id: &rp_id,
+                            user_id: &user_id,
+                        })?;
                         let payload = Self::make_credential_response(
                             &rp_id,
-                            &credential_id,
-                            public_key.to_bytes(),
+                            &registration.credential_id,
+                            registration.public_key,
                         )?;
-
-                        self.credentials.insert(
-                            credential_id.clone(),
-                            CredentialRecord {
-                                rp_id,
-                                signing_key,
-                                sign_count: 0,
-                            },
-                        );
-                        info!(
-                            "Stored credential id={:02x?}, total_credentials={}",
-                            credential_id,
-                            self.credentials.len()
-                        );
+                        info!("Stored credential id={:02x?}", registration.credential_id);
 
                         let response = CtapHidMessage {
                             cid: message.cid,
@@ -628,16 +619,14 @@ impl UhidAuthenticator {
             request.user_presence
         );
 
-        let credential_id = request.allow_list.iter().find(|credential_id| {
-            self.credentials
-                .get(*credential_id)
-                .is_some_and(|credential| credential.rp_id == request.rp_id)
-        });
-        let Some(credential_id) = credential_id.cloned() else {
+        if !self
+            .authenticator
+            .has_matching_credential(&request.rp_id, &request.allow_list)
+        {
             warn!("GetAssertion found no matching credential");
             self.send_cbor_status(message.cid, CTAP2_STATUS_NO_CREDENTIALS)?;
             return Ok(());
-        };
+        }
 
         if request.user_presence && !Self::confirm_user_presence("Authenticate this passkey?")? {
             warn!("User denied authenticatorGetAssertion");
@@ -645,43 +634,38 @@ impl UhidAuthenticator {
             return Ok(());
         }
 
-        let record = self
-            .credentials
-            .get_mut(&credential_id)
-            .expect("selected credential must still exist");
-        record.sign_count = record.sign_count.saturating_add(1);
-
-        let mut auth_data = Vec::with_capacity(37);
-        auth_data.extend_from_slice(&Sha256::digest(request.rp_id.as_bytes()));
-        auth_data.push(u8::from(request.user_presence));
-        auth_data.extend_from_slice(&record.sign_count.to_be_bytes());
-
-        let mut signed_data = auth_data.clone();
-        signed_data.extend_from_slice(&request.client_data_hash);
-        let signature = record.signing_key.sign(&signed_data).to_bytes().to_vec();
+        let assertion = self.authenticator.assert(AssertionRequest {
+            rp_id: &request.rp_id,
+            client_data_hash: &request.client_data_hash,
+            allow_list: &request.allow_list,
+            user_present: request.user_presence,
+        })?;
 
         let response = Value::Map(vec![
             (
                 Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_CREDENTIAL.into()),
                 Value::Map(vec![
-                    (Value::Text("id".into()), Value::Bytes(credential_id)),
+                    (
+                        Value::Text("id".into()),
+                        Value::Bytes(assertion.credential_id),
+                    ),
                     (Value::Text("type".into()), Value::Text("public-key".into())),
                 ]),
             ),
             (
                 Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_AUTH_DATA.into()),
-                Value::Bytes(auth_data),
+                Value::Bytes(assertion.authenticator_data),
             ),
             (
                 Value::Integer(CTAP2_GET_ASSERTION_RESPONSE_SIGNATURE.into()),
-                Value::Bytes(signature),
+                Value::Bytes(assertion.signature.to_vec()),
             ),
         ]);
         let mut payload = vec![CTAP2_STATUS_OK];
         ciborium::ser::into_writer(&response, &mut payload)?;
         info!(
             "GetAssertion signed credential, up={}, sign_count={}",
-            request.user_presence, record.sign_count
+            request.user_presence, assertion.sign_count
         );
         self.send_message(CtapHidMessage {
             cid: message.cid,
@@ -788,6 +772,31 @@ impl UhidAuthenticator {
         }
 
         Ok(None)
+    }
+
+    fn make_credential_user_id(payload: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        if payload.len() < 2 {
+            return Ok(None);
+        }
+
+        let request: Value = ciborium::de::from_reader(&payload[1..])?;
+        let Value::Map(entries) = request else {
+            return Ok(None);
+        };
+        let Some(Value::Map(user_entries)) = entries.into_iter().find_map(|(key, value)| {
+            (key == Value::Integer(CTAP2_MAKE_CREDENTIAL_USER.into())).then_some(value)
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(user_entries.into_iter().find_map(|(key, value)| {
+            (key == Value::Text("id".into()))
+                .then_some(value)
+                .and_then(|value| match value {
+                    Value::Bytes(id) => Some(id),
+                    _ => None,
+                })
+        }))
     }
 
     fn make_credential_algorithms(payload: &[u8]) -> Result<Vec<i64>, Box<dyn Error>> {
@@ -946,6 +955,26 @@ mod tests {
         let algorithms = UhidAuthenticator::make_credential_algorithms(&payload)
             .expect("algorithm list should parse");
         assert_eq!(algorithms, vec![-7, COSE_ALGORITHM_EDDSA]);
+    }
+
+    #[test]
+    fn parses_make_credential_user_id() {
+        let request = Value::Map(vec![(
+            Value::Integer(CTAP2_MAKE_CREDENTIAL_USER.into()),
+            Value::Map(vec![(
+                Value::Text("id".into()),
+                Value::Bytes(b"user-id".to_vec()),
+            )]),
+        )]);
+        let mut payload = vec![ctap2_command::MAKE_CREDENTIAL];
+        ciborium::ser::into_writer(&request, &mut payload).expect("request should encode");
+
+        assert_eq!(
+            UhidAuthenticator::make_credential_user_id(&payload)
+                .expect("user should parse")
+                .as_deref(),
+            Some(b"user-id".as_slice())
+        );
     }
 
     #[test]

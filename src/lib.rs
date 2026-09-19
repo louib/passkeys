@@ -1,6 +1,8 @@
 #[cfg(feature = "linux-uhid")]
 pub mod linux_uhid;
 
+pub mod authenticator;
+pub mod backend;
 pub mod ctap_hid;
 pub mod mpc;
 
